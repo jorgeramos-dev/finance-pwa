@@ -6,12 +6,14 @@
     <title>WALLET</title>
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#2563eb">
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="tailwind.css">
     <script src="https://cdn.jsdelivr.net/npm/dexie@3.2.4/dist/dexie.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { background-color: #f3f4f6; }
         .safe-area-bottom { padding-bottom: env(safe-area-inset-bottom); }
+        .toast-enter { animation: toastIn .25s ease-out; }
+        @keyframes toastIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body class="font-sans">
@@ -28,6 +30,7 @@
             <input type="password" id="pin-input" inputmode="numeric" pattern="[0-9]*" class="w-full text-center text-3xl tracking-widest p-3 border-2 border-gray-200 rounded-lg mb-4 focus:border-blue-500 outline-none" maxlength="6">
             <button id="unlock-btn" class="w-full bg-blue-600 text-white font-bold py-3 rounded-lg hover:bg-blue-700 transition">Entrar</button>
             <button id="set-pin-btn" class="w-full bg-green-600 text-white font-bold py-3 rounded-lg hover:bg-green-700 transition hidden">Definir PIN</button>
+            <button id="forgot-pin-btn" class="mt-3 text-xs text-blue-600 hover:underline">Esqueci meu PIN</button>
         </div>
     </div>
 
@@ -86,6 +89,9 @@
             <!-- Conteúdo dinâmico -->
         </div>
     </div>
+
+    <!-- Container de Toasts -->
+    <div id="toast-container" class="fixed top-4 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 pointer-events-none"></div>
 
     <script src="db.js"></script>
     <script src="app.js"></script>

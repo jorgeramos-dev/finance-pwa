@@ -42,6 +42,92 @@ document.addEventListener('DOMContentLoaded', async () => {
         return `${meses[m - 1]}/${y}`;
     };
 
+    // Parser de valor monetário BR (aceita "1.234,56", "1234.56", " R$ 12,30 ")
+    const parseValor = (input) => {
+        if (input === null || input === undefined) return NaN;
+        let s = String(input).trim().replace(/[R$\s]/g, '');
+        if (!s) return NaN;
+        if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+        const n = parseFloat(s);
+        return isNaN(n) ? NaN : n;
+    };
+    const fmtBR = (n) => Number(n || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    // --- UI Helpers: toast / confirm / prompt ---
+    const toast = (msg, type = 'info', ms = 2800) => {
+        const c = document.getElementById('toast-container');
+        if (!c) { console.log('[toast]', msg); return; }
+        const colors = {
+            success: 'bg-green-600',
+            error: 'bg-red-600',
+            warning: 'bg-yellow-500',
+            info: 'bg-blue-600'
+        };
+        const el = document.createElement('div');
+        el.className = `toast-enter pointer-events-auto text-white text-sm font-medium px-4 py-2 rounded-lg shadow-lg ${colors[type] || colors.info}`;
+        el.textContent = msg;
+        c.appendChild(el);
+        setTimeout(() => { el.style.transition = 'opacity .25s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 250); }, ms);
+    };
+    window.toast = toast;
+
+    const openModalHTML = (innerHTML) => {
+        const modal = document.getElementById('modal');
+        const body = document.getElementById('modal-body');
+        body.innerHTML = innerHTML;
+        modal.classList.remove('hidden');
+        return { modal, body };
+    };
+    const closeModalUI = () => document.getElementById('modal').classList.add('hidden');
+
+    // confirmDialog → Promise<boolean>
+    window.confirmDialog = ({ title = 'Confirmar', message = '', okText = 'Confirmar', cancelText = 'Cancelar', danger = false } = {}) => {
+        return new Promise((resolve) => {
+            const okClass = danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700';
+            openModalHTML(`
+                <h2 class="text-lg font-bold mb-2">${title}</h2>
+                <p class="text-sm text-gray-600 mb-5">${message}</p>
+                <div class="flex justify-end gap-2">
+                    <button id="cd-cancel" class="px-4 py-2 text-gray-700 rounded hover:bg-gray-100 transition">${cancelText}</button>
+                    <button id="cd-ok" class="px-4 py-2 text-white font-medium rounded transition ${okClass}">${okText}</button>
+                </div>
+            `);
+            document.getElementById('cd-cancel').onclick = () => { closeModalUI(); resolve(false); };
+            document.getElementById('cd-ok').onclick = () => { closeModalUI(); resolve(true); };
+        });
+    };
+
+    // promptDialog → Promise<string | null>  (type: 'text' | 'number' | 'money' | 'password')
+    window.promptDialog = ({ title = 'Informe um valor', message = '', label = '', type = 'text', placeholder = '', initial = '', okText = 'Salvar', cancelText = 'Cancelar', validate } = {}) => {
+        return new Promise((resolve) => {
+            const inputType = type === 'password' ? 'password' : (type === 'number' || type === 'money' ? 'text' : 'text');
+            const inputMode = (type === 'number' || type === 'money') ? 'decimal' : '';
+            openModalHTML(`
+                <h2 class="text-lg font-bold mb-2">${title}</h2>
+                ${message ? `<p class="text-sm text-gray-600 mb-3">${message}</p>` : ''}
+                ${label ? `<label class="block text-xs text-gray-500 mb-1">${label}</label>` : ''}
+                <input id="pd-input" type="${inputType}" inputmode="${inputMode}" placeholder="${placeholder}" value="${String(initial).replace(/"/g, '&quot;')}" class="w-full p-2 border-2 border-gray-200 rounded-lg mb-2 focus:border-blue-500 outline-none">
+                <p id="pd-err" class="text-xs text-red-600 mb-3 hidden"></p>
+                <div class="flex justify-end gap-2">
+                    <button id="pd-cancel" class="px-4 py-2 text-gray-700 rounded hover:bg-gray-100 transition">${cancelText}</button>
+                    <button id="pd-ok" class="px-4 py-2 bg-blue-600 text-white font-medium rounded hover:bg-blue-700 transition">${okText}</button>
+                </div>
+            `);
+            const input = document.getElementById('pd-input');
+            const err = document.getElementById('pd-err');
+            setTimeout(() => input.focus(), 50);
+            const submit = () => {
+                const raw = input.value;
+                const msg = validate ? validate(raw) : null;
+                if (msg) { err.textContent = msg; err.classList.remove('hidden'); return; }
+                closeModalUI(); resolve(raw);
+            };
+            document.getElementById('pd-cancel').onclick = () => { closeModalUI(); resolve(null); };
+            document.getElementById('pd-ok').onclick = submit;
+            input.onkeydown = (e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') { closeModalUI(); resolve(null); } };
+        });
+    };
+
     // Elementos DOM
     const appContainer = document.getElementById('app');
     const lockScreen = document.getElementById('lock-screen');
@@ -49,8 +135,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     const pinInput = document.getElementById('pin-input');
     const setPinBtn = document.getElementById('set-pin-btn');
     const unlockBtn = document.getElementById('unlock-btn');
+    const forgotPinBtn = document.getElementById('forgot-pin-btn');
 
     // Inicialização de Segurança
+    // Hashing de PIN (PBKDF2 + salt) usando SubtleCrypto
+    const toHex = (buf) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    const fromHex = (hex) => { const a = new Uint8Array(hex.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(hex.substr(i * 2, 2), 16); return a; };
+    const hashPin = async (pin, saltHex) => {
+        const enc = new TextEncoder();
+        const salt = saltHex ? fromHex(saltHex) : crypto.getRandomValues(new Uint8Array(16));
+        const key = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveBits']);
+        const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256);
+        return { salt: toHex(salt), hash: toHex(bits) };
+    };
+    const verifyPin = async (pin, stored) => {
+        if (!stored) return false;
+        if (typeof stored.value === 'string') return stored.value === pin; // legado: PIN em claro
+        const { salt, hash } = stored.value || {};
+        if (!salt || !hash) return false;
+        const r = await hashPin(pin, salt);
+        return r.hash === hash;
+    };
+
     const checkSecurity = async () => {
         const config = await db.config.get('pin');
         if (!config) {
@@ -66,34 +172,104 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     setPinBtn.onclick = async () => {
         const pin = pinInput.value;
-        if (pin.length >= 4) {
-            await db.config.put({ key: 'pin', value: pin });
-            alert('PIN definido com sucesso!');
-            checkSecurity();
-        } else {
-            alert('O PIN deve ter pelo menos 4 dígitos.');
-        }
+        if (pin.length < 4) { toast('O PIN deve ter pelo menos 4 dígitos.', 'warning'); return; }
+        const value = await hashPin(pin);
+        await db.config.put({ key: 'pin', value });
+        toast('PIN definido com sucesso!', 'success');
+        checkSecurity();
     };
 
     unlockBtn.onclick = async () => {
         const pin = pinInput.value;
         const config = await db.config.get('pin');
-        if (config && config.value === pin) {
-            state.isLocked = false;
-            lockScreen.classList.add('hidden');
-            mainContent.classList.remove('hidden');
-            renderView('dashboard');
-        } else {
-            alert('PIN incorreto!');
+        const ok = await verifyPin(pin, config);
+        if (!ok) { toast('PIN incorreto!', 'error'); return; }
+        // Migra PIN legado em claro para hash
+        if (config && typeof config.value === 'string') {
+            const value = await hashPin(pin);
+            await db.config.put({ key: 'pin', value });
         }
+        state.isLocked = false;
+        lockScreen.classList.add('hidden');
+        mainContent.classList.remove('hidden');
+        pinInput.value = '';
+        startInactivityTimer();
+        renderView('dashboard');
     };
 
     window.lockApp = () => {
         state.isLocked = true;
+        stopInactivityTimer();
         lockScreen.classList.remove('hidden');
         mainContent.classList.add('hidden');
         pinInput.value = '';
+        setTimeout(() => pinInput.focus(), 50);
     };
+
+    // Enter envia o PIN
+    pinInput.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        (setPinBtn.classList.contains('hidden') ? unlockBtn : setPinBtn).click();
+    });
+
+    // Esqueci meu PIN → restaurar via backup JSON
+    forgotPinBtn.onclick = async () => {
+        const ok = await confirmDialog({
+            title: 'Esqueci meu PIN',
+            message: 'Você pode redefinir o PIN restaurando um arquivo de backup JSON. Seus dados atuais não serão apagados — o backup será mesclado e o PIN será removido para você cadastrar um novo. Continuar?',
+            okText: 'Selecionar backup',
+            cancelText: 'Cancelar'
+        });
+        if (!ok) return;
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'application/json,.json';
+        input.onchange = async (ev) => {
+            const file = ev.target.files[0];
+            if (!file) return;
+            try {
+                const backup = JSON.parse(await file.text());
+                if (!backup || !backup.data) { toast('Arquivo inválido.', 'error'); return; }
+                await db.transaction('rw', [db.entradas, db.saidas, db.dividas, db.poupanca, db.metas, db.config], async () => {
+                    for (const t of BACKUP_TABLES) {
+                        const rows = Array.isArray(backup.data[t]) ? backup.data[t] : [];
+                        const rowsNoId = rows.map(({ id, ...rest }) => rest);
+                        if (rowsNoId.length) await db[t].bulkAdd(rowsNoId);
+                    }
+                    await db.config.delete('pin');
+                });
+                toast('Backup restaurado. Defina um novo PIN.', 'success');
+                await checkSecurity();
+            } catch (err) {
+                console.error(err);
+                toast('Erro ao restaurar: ' + err.message, 'error');
+            }
+        };
+        input.click();
+    };
+
+    // --- Auto-lock por inatividade ---
+    let inactivityTimer = null;
+    const getAutoLockMs = async () => {
+        const cfg = await db.config.get('autoLockMinutes');
+        const m = cfg ? parseFloat(cfg.value) : 5;
+        return (isNaN(m) || m <= 0) ? 0 : m * 60 * 1000;
+    };
+    const resetInactivityTimer = async () => {
+        if (state.isLocked) return;
+        clearTimeout(inactivityTimer);
+        const ms = await getAutoLockMs();
+        if (!ms) return;
+        inactivityTimer = setTimeout(() => { if (!state.isLocked) { toast('Bloqueado por inatividade.', 'info'); window.lockApp(); } }, ms);
+    };
+    const startInactivityTimer = () => {
+        resetInactivityTimer();
+        ['click', 'keydown', 'touchstart', 'pointermove'].forEach(ev =>
+            document.addEventListener(ev, resetInactivityTimer, { passive: true })
+        );
+    };
+    const stopInactivityTimer = () => { clearTimeout(inactivityTimer); inactivityTimer = null; };
 
     // Roteamento Simples
     window.renderView = async (view) => {
@@ -953,9 +1129,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         const counts = {};
         for (const t of BACKUP_TABLES) counts[t] = await db[t].count();
         const total = Object.values(counts).reduce((a, b) => a + b, 0);
+        const autoLockCfg = await db.config.get('autoLockMinutes');
+        const autoLockMin = autoLockCfg ? parseFloat(autoLockCfg.value) : 5;
 
         container.innerHTML = `
             <h2 class="text-xl font-bold mb-4">Configurações</h2>
+
+            <div class="bg-white rounded-lg shadow p-4 mb-4">
+                <h3 class="font-bold mb-2">Segurança</h3>
+                <label class="block text-sm text-gray-600 mb-1">Bloquear automaticamente após inatividade</label>
+                <div class="flex items-center gap-2">
+                    <select id="cfg-autolock" class="flex-1 p-2 border-2 border-gray-200 rounded-lg focus:border-blue-500 outline-none">
+                        <option value="0" ${autoLockMin === 0 ? 'selected' : ''}>Desativado</option>
+                        <option value="1" ${autoLockMin === 1 ? 'selected' : ''}>1 minuto</option>
+                        <option value="5" ${autoLockMin === 5 ? 'selected' : ''}>5 minutos</option>
+                        <option value="10" ${autoLockMin === 10 ? 'selected' : ''}>10 minutos</option>
+                        <option value="30" ${autoLockMin === 30 ? 'selected' : ''}>30 minutos</option>
+                    </select>
+                    <button onclick="saveAutoLock()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">Salvar</button>
+                </div>
+                <p class="text-xs text-gray-500 mt-2">O app será bloqueado após o tempo escolhido sem interação. Definir como "Desativado" mantém o app aberto até você bloquear manualmente.</p>
+            </div>
 
             <div class="bg-white rounded-lg shadow p-4 mb-4">
                 <h3 class="font-bold mb-2">Backup dos Dados</h3>
@@ -989,13 +1183,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         `;
     }
 
+    window.saveAutoLock = async () => {
+        const v = parseFloat(document.getElementById('cfg-autolock').value);
+        await db.config.put({ key: 'autoLockMinutes', value: isNaN(v) ? 0 : v });
+        await resetInactivityTimer();
+        toast('Configuração salva.', 'success');
+    };
+
     window.exportData = async () => {
         try {
             const data = {};
             for (const t of BACKUP_TABLES) data[t] = await db[t].toArray();
+            // Inclui config exceto o PIN
+            const configRows = await db.config.toArray();
+            data.config = configRows.filter(r => r.key !== 'pin');
             const backup = {
                 app: 'WALLET',
-                version: 1,
+                version: 2,
                 exportedAt: new Date().toISOString(),
                 data
             };
@@ -1009,9 +1213,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
+            toast('Backup exportado.', 'success');
         } catch (err) {
             console.error(err);
-            alert('Erro ao exportar backup: ' + err.message);
+            toast('Erro ao exportar backup: ' + err.message, 'error');
         }
     };
 
@@ -1022,25 +1227,51 @@ document.addEventListener('DOMContentLoaded', async () => {
             const text = await file.text();
             const backup = JSON.parse(text);
             if (!backup || !backup.data || typeof backup.data !== 'object') {
-                alert('Arquivo inválido. Selecione um backup gerado pelo WALLET.');
+                toast('Arquivo inválido. Selecione um backup gerado pelo WALLET.', 'error');
                 event.target.value = '';
                 return;
             }
-            const resumo = BACKUP_TABLES
+            const partes = BACKUP_TABLES
                 .map(t => `${t}: ${Array.isArray(backup.data[t]) ? backup.data[t].length : 0}`)
-                .join(', ');
-            const mode = prompt(
-                `Backup encontrado (${resumo}).\n\n` +
-                `Digite uma opção:\n` +
-                `1 = SUBSTITUIR todos os dados atuais pelos do backup\n` +
-                `2 = MESCLAR (adiciona os registros do backup aos atuais)\n` +
-                `Qualquer outra coisa = CANCELAR`
-            );
-            if (mode !== '1' && mode !== '2') {
-                event.target.value = '';
-                return;
+                .join(' · ');
+            const cfgCount = Array.isArray(backup.data.config) ? backup.data.config.length : 0;
+            const resumo = `${partes}${cfgCount ? ` · config: ${cfgCount}` : ''}`;
+
+            // Modal próprio com três botões
+            const mode = await new Promise((resolve) => {
+                openModalHTML(`
+                    <h2 class="text-lg font-bold mb-2">Restaurar Backup</h2>
+                    <p class="text-sm text-gray-600 mb-1">Arquivo carregado.</p>
+                    <p class="text-xs text-gray-500 mb-4">${resumo}</p>
+                    <p class="text-sm text-gray-700 mb-3">Como deseja restaurar?</p>
+                    <div class="flex flex-col gap-2">
+                        <button id="im-replace" class="w-full px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 transition text-left">
+                            <strong>Substituir</strong> — apaga os dados atuais e usa apenas os do backup
+                        </button>
+                        <button id="im-merge" class="w-full px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition text-left">
+                            <strong>Mesclar</strong> — adiciona os registros do backup aos atuais
+                        </button>
+                        <button id="im-cancel" class="w-full px-4 py-2 text-gray-700 rounded hover:bg-gray-100 transition">Cancelar</button>
+                    </div>
+                `);
+                document.getElementById('im-replace').onclick = () => { closeModalUI(); resolve('1'); };
+                document.getElementById('im-merge').onclick = () => { closeModalUI(); resolve('2'); };
+                document.getElementById('im-cancel').onclick = () => { closeModalUI(); resolve(null); };
+            });
+
+            if (mode !== '1' && mode !== '2') { event.target.value = ''; return; }
+
+            if (mode === '1') {
+                const ok = await confirmDialog({
+                    title: 'Confirmar substituição',
+                    message: 'Isso vai APAGAR todos os seus dados atuais antes de importar. Tem certeza?',
+                    okText: 'Substituir tudo',
+                    danger: true
+                });
+                if (!ok) { event.target.value = ''; return; }
             }
-            await db.transaction('rw', BACKUP_TABLES.map(t => db[t]), async () => {
+
+            await db.transaction('rw', [...BACKUP_TABLES.map(t => db[t]), db.config], async () => {
                 for (const t of BACKUP_TABLES) {
                     const rows = Array.isArray(backup.data[t]) ? backup.data[t] : [];
                     if (mode === '1') {
@@ -1051,13 +1282,19 @@ document.addEventListener('DOMContentLoaded', async () => {
                         if (rowsNoId.length) await db[t].bulkAdd(rowsNoId);
                     }
                 }
+                // Restaura config (sem sobrescrever o PIN atual)
+                const cfgRows = Array.isArray(backup.data.config) ? backup.data.config : [];
+                for (const r of cfgRows) {
+                    if (!r || !r.key || r.key === 'pin') continue;
+                    await db.config.put(r);
+                }
             });
-            alert('Backup restaurado com sucesso!');
+            toast('Backup restaurado com sucesso!', 'success');
             event.target.value = '';
             renderView('configuracoes');
         } catch (err) {
             console.error(err);
-            alert('Erro ao ler o arquivo: ' + err.message);
+            toast('Erro ao ler o arquivo: ' + err.message, 'error');
             event.target.value = '';
         }
     };
@@ -1067,133 +1304,202 @@ document.addEventListener('DOMContentLoaded', async () => {
         const modal = document.getElementById('modal');
         const modalBody = document.getElementById('modal-body');
         modal.classList.remove('hidden');
-        
-        let title = id ? 'Editar' : 'Novo Registro';
+
+        const titleMap = {
+            entrada: 'Nova Entrada', entradas: 'Editar Entrada',
+            saida: 'Nova Saída', saidas: 'Editar Saída',
+            divida: 'Nova Dívida', dividas: 'Editar Dívida',
+            poupanca: id ? 'Editar Lançamento' : 'Novo Lançamento de Poupança',
+            meta: 'Nova Meta', metas: 'Editar Meta'
+        };
+        const title = titleMap[type] || (id ? 'Editar' : 'Novo Registro');
+        const today = new Date().toISOString().slice(0, 10);
+        const inputCls = 'w-full p-2 border-2 border-gray-200 rounded-lg mb-3 focus:border-blue-500 outline-none';
+        const labelCls = 'block text-xs font-medium text-gray-600 mb-1';
+        const money = (id_, placeholder) => `<input type="text" id="${id_}" inputmode="decimal" placeholder="${placeholder}" class="${inputCls}">`;
         let fields = '';
         let action = id ? `updateItem('${type}', ${id})` : `saveItem('${type}')`;
 
         if (type === 'entrada' || type === 'entradas') {
             fields = `
-                <input type="text" id="m-desc" placeholder="Descrição" class="w-full p-2 border rounded mb-2">
-                <input type="number" id="m-valor" placeholder="Valor" step="0.01" class="w-full p-2 border rounded mb-2">
-                <input type="date" id="m-data" class="w-full p-2 border rounded mb-2">
+                <label class="${labelCls}">Descrição</label>
+                <input type="text" id="m-desc" placeholder="Ex.: Salário" class="${inputCls}">
+                <label class="${labelCls}">Valor (R$)</label>
+                ${money('m-valor', 'Ex.: 3500,00')}
+                <label class="${labelCls}">Data</label>
+                <input type="date" id="m-data" value="${today}" class="${inputCls}">
             `;
         } else if (type === 'saida' || type === 'saidas') {
             fields = `
-                <input type="text" id="m-desc" placeholder="Descrição" class="w-full p-2 border rounded mb-2">
-                <input type="number" id="m-valor" placeholder="Valor" step="0.01" class="w-full p-2 border rounded mb-2">
-                <input type="date" id="m-data" class="w-full p-2 border rounded mb-2">
-                <select id="m-tipo" class="w-full p-2 border rounded mb-2">
+                <label class="${labelCls}">Descrição</label>
+                <input type="text" id="m-desc" placeholder="Ex.: Mercado" class="${inputCls}">
+                <label class="${labelCls}">Valor (R$)</label>
+                ${money('m-valor', 'Ex.: 350,90')}
+                <label class="${labelCls}">Data</label>
+                <input type="date" id="m-data" value="${today}" class="${inputCls}">
+                <label class="${labelCls}">Tipo</label>
+                <select id="m-tipo" class="${inputCls}">
                     <option value="fixa">Fixa</option>
                     <option value="variavel">Variável</option>
                 </select>
-                <select id="m-status" class="w-full p-2 border rounded mb-2">
+                <label class="${labelCls}">Status</label>
+                <select id="m-status" class="${inputCls}">
                     <option value="pendente">Pendente</option>
                     <option value="pago">Pago</option>
                 </select>
             `;
         } else if (type === 'divida' || type === 'dividas') {
             fields = `
-                <input type="text" id="m-nome" placeholder="Credor" class="w-full p-2 border rounded mb-2">
-                <input type="number" id="m-valorOriginal" placeholder="Valor Original" step="0.01" class="w-full p-2 border rounded mb-2">
-                <input type="number" id="m-saldoDevedor" placeholder="Saldo Atual" step="0.01" class="w-full p-2 border rounded mb-2">
-                <input type="date" id="m-vencimento" class="w-full p-2 border rounded mb-2">
+                <label class="${labelCls}">Credor</label>
+                <input type="text" id="m-nome" placeholder="Ex.: Cartão Nubank" class="${inputCls}">
+                <label class="${labelCls}">Valor original (R$)</label>
+                ${money('m-valorOriginal', 'Ex.: 5000,00')}
+                <label class="${labelCls}">Saldo devedor atual (R$)</label>
+                ${money('m-saldoDevedor', 'Ex.: 3200,00')}
+                <label class="${labelCls}">Vencimento</label>
+                <input type="date" id="m-vencimento" class="${inputCls}">
             `;
         } else if (type === 'poupanca') {
             fields = `
-                <select id="m-tipo" class="w-full p-2 border rounded mb-2">
+                <label class="${labelCls}">Tipo</label>
+                <select id="m-tipo" class="${inputCls}">
                     <option value="reserva">Reserva de Emergência</option>
                     <option value="investimento">Investimento Longo Prazo</option>
                 </select>
-                <input type="number" id="m-valor" placeholder="Valor" step="0.01" class="w-full p-2 border rounded mb-2">
-                <input type="date" id="m-data" class="w-full p-2 border rounded mb-2">
+                <label class="${labelCls}">Valor (R$)</label>
+                ${money('m-valor', 'Ex.: 500,00')}
+                <label class="${labelCls}">Data</label>
+                <input type="date" id="m-data" value="${today}" class="${inputCls}">
             `;
         } else if (type === 'meta' || type === 'metas') {
             fields = `
-                <input type="text" id="m-nome" placeholder="Nome da Meta" class="w-full p-2 border rounded mb-2">
-                <input type="number" id="m-valorAlvo" placeholder="Valor Alvo" step="0.01" class="w-full p-2 border rounded mb-2">
-                <input type="number" id="m-valorGuardado" placeholder="Valor Já Guardado" step="0.01" class="w-full p-2 border rounded mb-2">
-                <input type="date" id="m-dataLimite" class="w-full p-2 border rounded mb-2">
+                <label class="${labelCls}">Nome da meta</label>
+                <input type="text" id="m-nome" placeholder="Ex.: Viagem" class="${inputCls}">
+                <label class="${labelCls}">Valor alvo (R$)</label>
+                ${money('m-valorAlvo', 'Ex.: 5000,00')}
+                <label class="${labelCls}">Valor já guardado (R$)</label>
+                ${money('m-valorGuardado', 'Ex.: 1200,00 (opcional)')}
+                <label class="${labelCls}">Data limite</label>
+                <input type="date" id="m-dataLimite" class="${inputCls}">
             `;
         }
 
         modalBody.innerHTML = `
             <h2 class="text-xl font-bold mb-4">${title}</h2>
             ${fields}
-            <div class="flex justify-end mt-4">
-                <button onclick="closeModal()" class="mr-2 px-4 py-2 text-gray-600">Cancelar</button>
-                <button onclick="${action}" class="px-4 py-2 bg-blue-600 text-white rounded">Salvar</button>
+            <div class="flex justify-end mt-2 gap-2">
+                <button onclick="closeModal()" class="px-4 py-2 text-gray-700 rounded hover:bg-gray-100 transition">Cancelar</button>
+                <button onclick="${action}" class="px-4 py-2 bg-blue-600 text-white font-medium rounded hover:bg-blue-700 transition">Salvar</button>
             </div>
         `;
 
-        if (id) fillModalData(type, id);
+        if (id) fillModalData(type === 'entrada' ? 'entradas' : type === 'saida' ? 'saidas' : type === 'divida' ? 'dividas' : type === 'meta' ? 'metas' : type, id);
     };
 
     window.closeModal = () => {
         document.getElementById('modal').classList.add('hidden');
     };
 
+    // Formata valor monetário para edição no input (BR: 1234.5 → "1234,50")
+    const moneyForInput = (n) => {
+        if (n === null || n === undefined || n === '') return '';
+        const v = parseFloat(n);
+        return isNaN(v) ? '' : v.toFixed(2).replace('.', ',');
+    };
     async function fillModalData(type, id) {
         const item = await db[type].get(id);
+        if (!item) return;
+        const set = (sel, v) => { const el = document.getElementById(sel); if (el) el.value = v ?? ''; };
         if (type === 'entradas') {
-            document.getElementById('m-desc').value = item.descricao;
-            document.getElementById('m-valor').value = item.valor;
-            document.getElementById('m-data').value = item.data;
+            set('m-desc', item.descricao); set('m-valor', moneyForInput(item.valor)); set('m-data', item.data);
         } else if (type === 'saidas') {
-            document.getElementById('m-desc').value = item.descricao;
-            document.getElementById('m-valor').value = item.valor;
-            document.getElementById('m-data').value = item.data;
-            document.getElementById('m-tipo').value = item.tipo;
-            document.getElementById('m-status').value = item.status;
+            set('m-desc', item.descricao); set('m-valor', moneyForInput(item.valor)); set('m-data', item.data);
+            set('m-tipo', item.tipo); set('m-status', item.status);
         } else if (type === 'dividas') {
-            document.getElementById('m-nome').value = item.nome;
-            document.getElementById('m-valorOriginal').value = item.valorOriginal;
-            document.getElementById('m-saldoDevedor').value = item.saldoDevedor;
-            document.getElementById('m-vencimento').value = item.vencimento;
+            set('m-nome', item.nome); set('m-valorOriginal', moneyForInput(item.valorOriginal));
+            set('m-saldoDevedor', moneyForInput(item.saldoDevedor)); set('m-vencimento', item.vencimento);
         } else if (type === 'poupanca') {
-            document.getElementById('m-tipo').value = item.tipo;
-            document.getElementById('m-valor').value = item.valor;
-            document.getElementById('m-data').value = item.data;
+            set('m-tipo', item.tipo); set('m-valor', moneyForInput(item.valor)); set('m-data', item.data);
         } else if (type === 'metas') {
-            document.getElementById('m-nome').value = item.nome;
-            document.getElementById('m-valorAlvo').value = item.valorAlvo;
-            document.getElementById('m-valorGuardado').value = item.valorGuardado;
-            document.getElementById('m-dataLimite').value = item.dataLimite;
+            set('m-nome', item.nome); set('m-valorAlvo', moneyForInput(item.valorAlvo));
+            set('m-valorGuardado', moneyForInput(item.valorGuardado)); set('m-dataLimite', item.dataLimite);
         }
     }
 
-    window.saveItem = async (type) => {
-        let data = {};
-        let table = type;
-        if (type === 'entrada') { table = 'entradas'; data = { descricao: document.getElementById('m-desc').value, valor: document.getElementById('m-valor').value, data: document.getElementById('m-data').value }; }
-        if (type === 'saida') { table = 'saidas'; data = { descricao: document.getElementById('m-desc').value, valor: document.getElementById('m-valor').value, data: document.getElementById('m-data').value, tipo: document.getElementById('m-tipo').value, status: document.getElementById('m-status').value }; }
-        if (type === 'divida') { table = 'dividas'; data = { nome: document.getElementById('m-nome').value, valorOriginal: document.getElementById('m-valorOriginal').value, saldoDevedor: document.getElementById('m-saldoDevedor').value, vencimento: document.getElementById('m-vencimento').value }; }
-        if (type === 'poupanca') { table = 'poupanca'; data = { tipo: document.getElementById('m-tipo').value, valor: document.getElementById('m-valor').value, data: document.getElementById('m-data').value }; }
-        if (type === 'meta') { table = 'metas'; data = { nome: document.getElementById('m-nome').value, valorAlvo: document.getElementById('m-valorAlvo').value, valorGuardado: document.getElementById('m-valorGuardado').value, dataLimite: document.getElementById('m-dataLimite').value }; }
+    // Constrói e valida o payload a partir do form do modal.
+    // Retorna { data, error } — se error não é null, exibe toast e cancela.
+    const buildPayload = (type) => {
+        const val = (sel) => (document.getElementById(sel) ? document.getElementById(sel).value : '').trim();
+        const reqText = (v, label) => v ? null : `${label} é obrigatório.`;
+        const reqDate = (v, label) => v ? null : `${label} é obrigatória.`;
+        const reqMoney = (v, label, { allowZero = false } = {}) => {
+            const n = parseValor(v);
+            if (isNaN(n)) return `${label} inválido.`;
+            if (!allowZero && n <= 0) return `${label} deve ser maior que zero.`;
+            if (allowZero && n < 0) return `${label} não pode ser negativo.`;
+            return null;
+        };
+        const norm = (t) => t === 'entrada' ? 'entradas'
+            : t === 'saida' ? 'saidas'
+            : t === 'divida' ? 'dividas'
+            : t === 'meta' ? 'metas'
+            : t;
+        const table = norm(type);
+        let data = {}, error = null;
 
+        if (table === 'entradas') {
+            const desc = val('m-desc'), valor = val('m-valor'), dataI = val('m-data');
+            error = reqText(desc, 'Descrição') || reqMoney(valor, 'Valor') || reqDate(dataI, 'Data');
+            data = { descricao: desc, valor: parseValor(valor), data: dataI };
+        } else if (table === 'saidas') {
+            const desc = val('m-desc'), valor = val('m-valor'), dataI = val('m-data');
+            error = reqText(desc, 'Descrição') || reqMoney(valor, 'Valor') || reqDate(dataI, 'Data');
+            data = { descricao: desc, valor: parseValor(valor), data: dataI, tipo: val('m-tipo'), status: val('m-status') };
+        } else if (table === 'dividas') {
+            const nome = val('m-nome'), vo = val('m-valorOriginal'), sd = val('m-saldoDevedor'), venc = val('m-vencimento');
+            error = reqText(nome, 'Credor') || reqMoney(vo, 'Valor original') || reqMoney(sd, 'Saldo atual', { allowZero: true }) || reqDate(venc, 'Vencimento');
+            data = { nome, valorOriginal: parseValor(vo), saldoDevedor: parseValor(sd), vencimento: venc };
+        } else if (table === 'poupanca') {
+            const valor = val('m-valor'), dataI = val('m-data');
+            error = reqMoney(valor, 'Valor') || reqDate(dataI, 'Data');
+            data = { tipo: val('m-tipo'), valor: parseValor(valor), data: dataI };
+        } else if (table === 'metas') {
+            const nome = val('m-nome'), va = val('m-valorAlvo'), vg = val('m-valorGuardado'), dl = val('m-dataLimite');
+            error = reqText(nome, 'Nome da meta') || reqMoney(va, 'Valor alvo') || reqMoney(vg || '0', 'Valor guardado', { allowZero: true }) || reqDate(dl, 'Data limite');
+            data = { nome, valorAlvo: parseValor(va), valorGuardado: parseValor(vg || '0'), dataLimite: dl };
+        }
+        return { table, data, error };
+    };
+
+    window.saveItem = async (type) => {
+        const { table, data, error } = buildPayload(type);
+        if (error) { toast(error, 'warning'); return; }
         await db[table].add(data);
         closeModal();
+        toast('Registro adicionado.', 'success');
         renderView(state.currentView);
     };
 
     window.updateItem = async (type, id) => {
-        let data = {};
-        if (type === 'entradas') { data = { descricao: document.getElementById('m-desc').value, valor: document.getElementById('m-valor').value, data: document.getElementById('m-data').value }; }
-        if (type === 'saidas') { data = { descricao: document.getElementById('m-desc').value, valor: document.getElementById('m-valor').value, data: document.getElementById('m-data').value, tipo: document.getElementById('m-tipo').value, status: document.getElementById('m-status').value }; }
-        if (type === 'dividas') { data = { nome: document.getElementById('m-nome').value, valorOriginal: document.getElementById('m-valorOriginal').value, saldoDevedor: document.getElementById('m-saldoDevedor').value, vencimento: document.getElementById('m-vencimento').value }; }
-        if (type === 'poupanca') { data = { tipo: document.getElementById('m-tipo').value, valor: document.getElementById('m-valor').value, data: document.getElementById('m-data').value }; }
-        if (type === 'metas') { data = { nome: document.getElementById('m-nome').value, valorAlvo: document.getElementById('m-valorAlvo').value, valorGuardado: document.getElementById('m-valorGuardado').value, dataLimite: document.getElementById('m-dataLimite').value }; }
-
-        await db[type].update(id, data);
+        const { table, data, error } = buildPayload(type);
+        if (error) { toast(error, 'warning'); return; }
+        await db[table].update(id, data);
         closeModal();
+        toast('Registro atualizado.', 'success');
         renderView(state.currentView);
     };
 
     window.deleteItem = async (table, id) => {
-        if (confirm('Tem certeza que deseja excluir este registro?')) {
-            await db[table].delete(id);
-            renderView(state.currentView);
-        }
+        const ok = await confirmDialog({
+            title: 'Excluir registro',
+            message: 'Tem certeza que deseja excluir este registro? Esta ação não pode ser desfeita.',
+            okText: 'Excluir',
+            danger: true
+        });
+        if (!ok) return;
+        await db[table].delete(id);
+        toast('Registro excluído.', 'success');
+        renderView(state.currentView);
     };
 
     window.editItem = (table, id) => {
@@ -1254,23 +1560,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.setReservaMeta = async () => {
         const atual = await db.config.get('metaReserva');
         const valorAtual = atual ? parseFloat(atual.value) : 10000;
-        const valorStr = prompt(`Meta da reserva de emergência\nValor atual: R$ ${valorAtual.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}\n\nDigite o novo valor (use ponto para decimais):`);
-        if (valorStr === null) return;
-        const valor = parseFloat(valorStr.replace(',', '.'));
-        if (isNaN(valor) || valor <= 0) { alert('Valor inválido.'); return; }
-        await db.config.put({ key: 'metaReserva', value: valor });
+        const raw = await promptDialog({
+            title: 'Meta da reserva de emergência',
+            message: `Valor atual: R$ ${fmtBR(valorAtual)}`,
+            label: 'Novo valor',
+            type: 'money',
+            placeholder: 'Ex.: 10000,00',
+            initial: String(valorAtual).replace('.', ','),
+            validate: (v) => { const n = parseValor(v); return (isNaN(n) || n <= 0) ? 'Informe um valor maior que zero.' : null; }
+        });
+        if (raw === null) return;
+        await db.config.put({ key: 'metaReserva', value: parseValor(raw) });
+        toast('Meta atualizada.', 'success');
         renderView('dashboard');
     };
 
     window.addAporteMeta = async (id) => {
         const meta = await db.metas.get(id);
         if (!meta) return;
-        const valorStr = prompt(`Aporte para "${meta.nome}"\nValor guardado atual: R$ ${parseFloat(meta.valorGuardado || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}\n\nDigite o valor a adicionar (use ponto para decimais):`);
-        if (valorStr === null) return;
-        const valor = parseFloat(valorStr.replace(',', '.'));
-        if (isNaN(valor) || valor <= 0) { alert('Valor inválido.'); return; }
+        const raw = await promptDialog({
+            title: `Aporte: ${meta.nome}`,
+            message: `Valor guardado atual: R$ ${fmtBR(meta.valorGuardado)}`,
+            label: 'Valor a adicionar',
+            type: 'money',
+            placeholder: 'Ex.: 250,00',
+            validate: (v) => { const n = parseValor(v); return (isNaN(n) || n <= 0) ? 'Informe um valor maior que zero.' : null; }
+        });
+        if (raw === null) return;
+        const valor = parseValor(raw);
         const novoGuardado = parseFloat(meta.valorGuardado || 0) + valor;
         await db.metas.update(id, { valorGuardado: novoGuardado });
+        toast(`Aporte de R$ ${fmtBR(valor)} registrado.`, 'success');
         renderView('metas');
     };
 

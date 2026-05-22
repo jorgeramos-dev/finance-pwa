@@ -1,0 +1,29 @@
+{
+  "name": "finance-pwa",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "build:css": "tailwindcss -i ./tailwind.input.css -o ./tailwind.css --minify",
+    "watch:css": "tailwindcss -i ./tailwind.input.css -o ./tailwind.css --watch",
+    "gen:icons": "node scripts/gen-icons.js",
+    "build": "npm run gen:icons && npm run build:css",
+    "start": "npx serve ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jorgeramos-dev/finance-pwa.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/jorgeramos-dev/finance-pwa/issues"
+  },
+  "homepage": "https://github.com/jorgeramos-dev/finance-pwa#readme",
+  "devDependencies": {
+    "sharp": "^0.34.5",
+    "tailwindcss": "^3.4.1"
+  }
+}
