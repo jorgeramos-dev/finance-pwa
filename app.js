@@ -12,18 +12,33 @@ document.addEventListener('DOMContentLoaded', async () => {
         navigator.storage.persist().catch(() => {});
     }
 
+    // Garante categorias padrao (idempotente)
+    try { await ensureCategoriasSeed(); } catch (err) { console.warn('Seed categorias falhou:', err); }
+
     // Estado da Aplicação
     const state = {
         isLocked: true,
         currentView: 'dashboard',
         charts: {},
         currentMonth: new Date().toISOString().slice(0, 7), // YYYY-MM
-        entradasFilter: { mode: 'month', month: new Date().toISOString().slice(0, 7) },
-        saidasFilter: { mode: 'month', month: new Date().toISOString().slice(0, 7), status: 'all', tipo: 'all' },
-        dividasFilter: { status: 'ativas', sort: 'vencimento' },
-        poupancaFilter: { mode: 'all', month: new Date().toISOString().slice(0, 7), tipo: 'all' },
-        metasFilter: { status: 'ativas' }
+        entradasFilter: { mode: 'month', month: new Date().toISOString().slice(0, 7), categoria: 'all', q: '' },
+        saidasFilter: { mode: 'month', month: new Date().toISOString().slice(0, 7), status: 'all', tipo: 'all', categoria: 'all', q: '' },
+        dividasFilter: { status: 'ativas', sort: 'vencimento', q: '' },
+        poupancaFilter: { mode: 'all', month: new Date().toISOString().slice(0, 7), tipo: 'all', q: '' },
+        metasFilter: { status: 'ativas', q: '' }
     };
+
+    // Helpers de categorias (cache em memoria, invalidado por refreshCategorias)
+    let _categoriasCache = null;
+    const getCategorias = async (kind) => {
+        if (!_categoriasCache) _categoriasCache = await db.categorias.toArray();
+        return kind ? _categoriasCache.filter(c => c.kind === kind) : _categoriasCache;
+    };
+    const refreshCategorias = () => { _categoriasCache = null; };
+
+    // Normaliza texto para busca (case/acento-insensivel)
+    const normSearch = (s) => (s || '').toString().toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
     // Helpers de mês (YYYY-MM)
     const getPrevMonth = (yyyymm) => {
@@ -41,6 +56,58 @@ document.addEventListener('DOMContentLoaded', async () => {
         const meses = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
         return `${meses[m - 1]}/${y}`;
     };
+
+    // Gera lancamentos recorrentes do mes corrente a partir do template (ultimo registro recorrente
+    // com o mesmo descricao+categoria). Idempotente: usa db.config['recurringLastRun'] para nao
+    // rodar duas vezes no mesmo mes e checa duplicatas antes de inserir.
+    async function processRecurring() {
+        const nowMonth = new Date().toISOString().slice(0, 7);
+        const lastRun = await db.config.get('recurringLastRun');
+        if (lastRun && lastRun.value === nowMonth) return;
+        const todayISO = new Date().toISOString().slice(0, 10);
+        const monthOf = (d) => (d || '').slice(0, 7);
+        const dayOf = (d) => parseInt((d || '').slice(8, 10), 10) || 1;
+        const adjustToCurrentMonth = (templateDate) => {
+            const [y, m] = nowMonth.split('-').map(Number);
+            const lastDay = new Date(y, m, 0).getDate();
+            const day = Math.min(dayOf(templateDate), lastDay);
+            return `${nowMonth}-${String(day).padStart(2, '0')}`;
+        };
+        let created = 0;
+        for (const tableName of ['entradas', 'saidas']) {
+            const all = await db[tableName].toArray();
+            const templates = all.filter(it => it.recorrente);
+            // Agrupa pelo par descricao+categoria, pegando o mais recente como modelo
+            const groups = new Map();
+            for (const t of templates) {
+                const key = `${t.descricao}||${t.categoria || 'Outros'}`;
+                const prev = groups.get(key);
+                if (!prev || (t.data || '') > (prev.data || '')) groups.set(key, t);
+            }
+            for (const tpl of groups.values()) {
+                // Se ja existe um registro neste mes com mesmo desc+categoria, pula
+                const exists = all.some(it => monthOf(it.data) === nowMonth
+                    && it.descricao === tpl.descricao
+                    && (it.categoria || 'Outros') === (tpl.categoria || 'Outros'));
+                if (exists) continue;
+                const novo = {
+                    descricao: tpl.descricao,
+                    valor: parseFloat(tpl.valor) || 0,
+                    data: adjustToCurrentMonth(tpl.data || todayISO),
+                    categoria: tpl.categoria || 'Outros',
+                    recorrente: 1
+                };
+                if (tableName === 'saidas') {
+                    novo.tipo = tpl.tipo || 'fixa';
+                    novo.status = 'pendente';
+                }
+                await db[tableName].add(novo);
+                created++;
+            }
+        }
+        await db.config.put({ key: 'recurringLastRun', value: nowMonth });
+        if (created > 0) setTimeout(() => toast(`${created} lancamento(s) recorrente(s) gerado(s) para ${formatMonthLabel(nowMonth)}.`, 'info', 4000), 400);
+    }
 
     // Parser de valor monetário BR (aceita "1.234,56", "1234.56", " R$ 12,30 ")
     const parseValor = (input) => {
@@ -194,6 +261,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         mainContent.classList.remove('hidden');
         pinInput.value = '';
         startInactivityTimer();
+        try { await processRecurring(); } catch (err) { console.warn('Recorrencias falharam:', err); }
         renderView('dashboard');
     };
 
@@ -326,6 +394,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         const pendentesMes = saidasMes.filter(s => s.status === 'pendente');
         const totalPendentesMes = sum(pendentesMes);
 
+        // Agrega saidas do mes por categoria (Top 5 + "Outras")
+        const catMap = new Map();
+        for (const s of saidasMes) {
+            const k = s.categoria || 'Outros';
+            catMap.set(k, (catMap.get(k) || 0) + parseFloat(s.valor || 0));
+        }
+        const catRanking = Array.from(catMap.entries())
+            .map(([nome, total]) => ({ nome, total }))
+            .sort((a, b) => b.total - a.total);
+        const top5 = catRanking.slice(0, 5);
+        const restoTotal = catRanking.slice(5).reduce((a, b) => a + b.total, 0);
+        const catChartLabels = top5.map(c => c.nome).concat(restoTotal > 0 ? ['Outras'] : []);
+        const catChartData = top5.map(c => c.total).concat(restoTotal > 0 ? [restoTotal] : []);
+        const catTotal = catChartData.reduce((a, b) => a + b, 0);
+        const catPalette = ['#dc2626', '#ea580c', '#d97706', '#7c3aed', '#0891b2', '#6b7280'];
+
         const today = new Date(); today.setHours(0, 0, 0, 0);
         const venceEm = (v) => { if (!v) return null; const [y, m, d] = v.split('-').map(Number); return Math.round((new Date(y, m - 1, d) - today) / 86400000); };
         const dividasUrgentes = dividas.filter(d => { const di = venceEm(d.vencimento); return parseFloat(d.saldoDevedor || 0) > 0 && di !== null && di <= 7; });
@@ -395,6 +479,34 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <canvas id="mainChart" height="100"></canvas>
             </div>
 
+            <div class="bg-white p-4 rounded-lg shadow mb-4">
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="font-bold text-gray-700">Gastos por categoria — ${monthLabel}</h3>
+                    ${catTotal > 0 ? `<span class="text-xs text-gray-500">Total R$ ${fmt(catTotal)}</span>` : ''}
+                </div>
+                ${catTotal === 0 ? `<p class="text-sm text-gray-400 text-center py-6">Sem saídas categorizadas neste mês</p>` : `
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                        <div class="relative mx-auto" style="height:200px;max-width:240px"><canvas id="categoriaChart"></canvas></div>
+                        <div class="space-y-2">
+                            ${top5.map((c, idx) => {
+                                const pct = catTotal > 0 ? (c.total / catTotal) * 100 : 0;
+                                return `
+                                    <div>
+                                        <div class="flex justify-between text-xs mb-1">
+                                            <span class="font-medium flex items-center gap-2"><span class="inline-block w-3 h-3 rounded" style="background:${catPalette[idx]}"></span>${escapeHtml(c.nome)}</span>
+                                            <span class="text-gray-600">R$ ${fmt(c.total)} • ${pct.toFixed(1)}%</span>
+                                        </div>
+                                        <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                                            <div class="h-2 rounded-full" style="width:${pct}%;background:${catPalette[idx]}"></div>
+                                        </div>
+                                    </div>`;
+                            }).join('')}
+                            ${restoTotal > 0 ? `<p class="text-xs text-gray-400">+ ${catRanking.length - 5} outra(s) categoria(s) — R$ ${fmt(restoTotal)}</p>` : ''}
+                        </div>
+                    </div>
+                `}
+            </div>
+
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                 <div class="bg-white p-4 rounded-lg shadow">
                     <h3 class="font-bold mb-3 text-gray-700">Saídas de ${monthLabel} por tipo</h3>
@@ -456,6 +568,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                 options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
             });
         }
+        if (catTotal > 0) {
+            const catEl = document.getElementById('categoriaChart');
+            if (catEl) {
+                state.charts.categoria = new Chart(catEl.getContext('2d'), {
+                    type: 'doughnut',
+                    data: { labels: catChartLabels, datasets: [{ data: catChartData, backgroundColor: catPalette.slice(0, catChartData.length) }] },
+                    options: { responsive: true, maintainAspectRatio: false, cutout: '60%', plugins: { legend: { display: false } } }
+                });
+            }
+        }
     }
 
     // --- Módulo 2: Entradas ---
@@ -463,9 +585,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         const filter = state.entradasFilter;
         const allItems = await db.entradas.orderBy('data').reverse().toArray();
         const monthOf = (d) => (d || '').slice(0, 7);
-        const items = filter.mode === 'month'
+        let items = filter.mode === 'month'
             ? allItems.filter(i => monthOf(i.data) === filter.month)
             : allItems;
+        if (filter.categoria && filter.categoria !== 'all') {
+            items = items.filter(i => (i.categoria || 'Outros') === filter.categoria);
+        }
+        if (filter.q && filter.q.trim()) {
+            const q = normSearch(filter.q);
+            items = items.filter(i => normSearch(i.descricao).includes(q));
+        }
+        const cats = await getCategorias('entrada');
 
         const sum = (arr) => arr.reduce((a, b) => a + parseFloat(b.valor || 0), 0);
         const totalMes = sum(allItems.filter(i => monthOf(i.data) === filter.month));
@@ -526,13 +656,23 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </button>
             </div>
 
+            <div class="bg-white p-3 rounded-lg shadow mb-4 flex flex-wrap gap-2 items-center">
+                <div class="flex-1 min-w-0">
+                    <input type="search" id="entradas-search" value="${escapeHtml(filter.q)}" placeholder="Buscar por descricao..." class="w-full p-2 border-2 border-gray-200 rounded-lg focus:border-blue-500 outline-none text-sm" oninput="onSearchInput('entradas', this.value)">
+                </div>
+                <select onchange="setEntradasCategoria(this.value)" class="p-2 border-2 border-gray-200 rounded-lg focus:border-blue-500 outline-none text-sm">
+                    <option value="all" ${filter.categoria === 'all' ? 'selected' : ''}>Todas as categorias</option>
+                    ${cats.map(c => `<option value="${escapeHtml(c.nome)}" ${filter.categoria === c.nome ? 'selected' : ''}>${escapeHtml(c.nome)}</option>`).join('')}
+                </select>
+            </div>
+
             ${items.length === 0 ? `
                 <div class="bg-white rounded-lg shadow p-10 text-center">
                     <div class="bg-green-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4">
                         <svg class="w-10 h-10 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1"></path></svg>
                     </div>
-                    <h3 class="font-bold text-gray-700 mb-1">${isMonth ? `Nenhuma entrada em ${monthLabel}` : 'Nenhuma entrada registrada'}</h3>
-                    <p class="text-sm text-gray-500 mb-4">Adicione uma nova entrada para começar a acompanhar.</p>
+                    <h3 class="font-bold text-gray-700 mb-1">${(filter.q || filter.categoria !== 'all') ? 'Nenhum resultado para os filtros' : (isMonth ? `Nenhuma entrada em ${monthLabel}` : 'Nenhuma entrada registrada')}</h3>
+                    <p class="text-sm text-gray-500 mb-4">${(filter.q || filter.categoria !== 'all') ? 'Ajuste a busca ou os filtros.' : 'Adicione uma nova entrada para começar a acompanhar.'}</p>
                     <button onclick="showModal('entrada')" class="bg-blue-600 text-white px-5 py-2 rounded hover:bg-blue-700 transition">+ Nova Entrada</button>
                 </div>
             ` : `
@@ -549,6 +689,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                             <tr>
                                 <th class="p-3">Data</th>
                                 <th class="p-3">Descrição</th>
+                                <th class="p-3">Categoria</th>
                                 <th class="p-3">Valor</th>
                                 <th class="p-3 text-right">Ações</th>
                             </tr>
@@ -557,7 +698,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                             ${items.map(item => `
                                 <tr class="border-t hover:bg-gray-50 transition">
                                     <td class="p-3 text-sm text-gray-600">${formatDateBR(item.data)}</td>
-                                    <td class="p-3">${item.descricao}</td>
+                                    <td class="p-3">${escapeHtml(item.descricao)} ${item.recorrente ? '<span title="Recorrente mensal" class="text-xs text-blue-600 ml-1">↻</span>' : ''}</td>
+                                    <td class="p-3"><span class="text-xs bg-gray-100 px-2 py-1 rounded">${escapeHtml(item.categoria || 'Outros')}</span></td>
                                     <td class="p-3 text-green-600 font-bold">R$ ${fmt(parseFloat(item.valor))}</td>
                                     <td class="p-3 text-right whitespace-nowrap">
                                         <button onclick="editItem('entradas', ${item.id})" class="text-blue-600 mr-1 p-2 rounded hover:bg-blue-50 transition" title="Editar"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg></button>
@@ -573,8 +715,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                     ${items.map(item => `
                         <div class="bg-white rounded-lg shadow p-3 border-l-4 border-green-500 flex justify-between items-center">
                             <div class="min-w-0 flex-1">
-                                <p class="font-medium truncate">${item.descricao}</p>
-                                <p class="text-xs text-gray-500">${formatDateBR(item.data)}</p>
+                                <p class="font-medium truncate">${escapeHtml(item.descricao)} ${item.recorrente ? '<span title="Recorrente mensal" class="text-xs text-blue-600">↻</span>' : ''}</p>
+                                <div class="flex items-center gap-2 mt-1">
+                                    <span class="text-xs text-gray-500">${formatDateBR(item.data)}</span>
+                                    <span class="text-xs bg-gray-100 px-2 py-0.5 rounded">${escapeHtml(item.categoria || 'Outros')}</span>
+                                </div>
                             </div>
                             <div class="text-right ml-3 flex-shrink-0">
                                 <p class="font-bold text-green-600 mb-1">R$ ${fmt(parseFloat(item.valor))}</p>
@@ -588,6 +733,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </div>
             `}
         `;
+        // Mantem foco no input apos re-render
+        const searchEl = document.getElementById('entradas-search');
+        if (searchEl && filter.q) {
+            const len = searchEl.value.length;
+            searchEl.focus();
+            try { searchEl.setSelectionRange(len, len); } catch (_) {}
+        }
     }
 
     // --- Módulo 3: Saídas ---
@@ -600,6 +752,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             : allItems;
         if (filter.status !== 'all') items = items.filter(i => i.status === filter.status);
         if (filter.tipo !== 'all') items = items.filter(i => i.tipo === filter.tipo);
+        if (filter.categoria && filter.categoria !== 'all') {
+            items = items.filter(i => (i.categoria || 'Outros') === filter.categoria);
+        }
+        if (filter.q && filter.q.trim()) {
+            const q = normSearch(filter.q);
+            items = items.filter(i => normSearch(i.descricao).includes(q));
+        }
+        const cats = await getCategorias('saida');
 
         const sum = (arr) => arr.reduce((a, b) => a + parseFloat(b.valor || 0), 0);
         const mesArr = allItems.filter(i => monthOf(i.data) === filter.month);
@@ -665,7 +825,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </button>
             </div>
 
-            <div class="bg-white p-3 rounded-lg shadow mb-4 flex flex-wrap gap-2 items-center">
+            <div class="bg-white p-3 rounded-lg shadow mb-3 flex flex-wrap gap-2 items-center">
                 <span class="text-xs text-gray-500 mr-1">Status:</span>
                 <button onclick="setSaidasStatus('all')" class="${chipBase} ${filter.status === 'all' ? 'bg-red-600 text-white' : chipOff}">Todas</button>
                 <button onclick="setSaidasStatus('pago')" class="${chipBase} ${filter.status === 'pago' ? 'bg-green-600 text-white' : chipOff}">Pagas</button>
@@ -674,6 +834,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <button onclick="setSaidasTipo('all')" class="${chipBase} ${filter.tipo === 'all' ? 'bg-red-600 text-white' : chipOff}">Todos</button>
                 <button onclick="setSaidasTipo('fixa')" class="${chipBase} ${filter.tipo === 'fixa' ? 'bg-red-600 text-white' : chipOff}">Fixa</button>
                 <button onclick="setSaidasTipo('variavel')" class="${chipBase} ${filter.tipo === 'variavel' ? 'bg-red-600 text-white' : chipOff}">Variável</button>
+            </div>
+
+            <div class="bg-white p-3 rounded-lg shadow mb-4 flex flex-wrap gap-2 items-center">
+                <div class="flex-1 min-w-0">
+                    <input type="search" id="saidas-search" value="${escapeHtml(filter.q)}" placeholder="Buscar por descricao..." class="w-full p-2 border-2 border-gray-200 rounded-lg focus:border-red-500 outline-none text-sm" oninput="onSearchInput('saidas', this.value)">
+                </div>
+                <select onchange="setSaidasCategoria(this.value)" class="p-2 border-2 border-gray-200 rounded-lg focus:border-red-500 outline-none text-sm">
+                    <option value="all" ${filter.categoria === 'all' ? 'selected' : ''}>Todas as categorias</option>
+                    ${cats.map(c => `<option value="${escapeHtml(c.nome)}" ${filter.categoria === c.nome ? 'selected' : ''}>${escapeHtml(c.nome)}</option>`).join('')}
+                </select>
             </div>
 
             ${items.length === 0 ? `
@@ -696,7 +866,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                         <thead class="bg-gray-50 text-xs uppercase text-gray-600">
                             <tr>
                                 <th class="p-3">Status</th><th class="p-3">Data</th><th class="p-3">Descrição</th>
-                                <th class="p-3">Tipo</th><th class="p-3">Valor</th><th class="p-3 text-right">Ações</th>
+                                <th class="p-3">Categoria</th><th class="p-3">Tipo</th><th class="p-3">Valor</th><th class="p-3 text-right">Ações</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -704,7 +874,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                                 <tr class="border-t hover:bg-gray-50 transition">
                                     <td class="p-3"><button onclick="toggleStatus('saidas', ${item.id}, '${item.status}')" class="px-2 py-1 rounded text-xs font-bold transition ${item.status === 'pago' ? 'bg-green-100 text-green-700 hover:bg-green-200' : 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200'}">${item.status.toUpperCase()}</button></td>
                                     <td class="p-3 text-sm text-gray-600">${formatDateBR(item.data)}</td>
-                                    <td class="p-3">${item.descricao}</td>
+                                    <td class="p-3">${escapeHtml(item.descricao)} ${item.recorrente ? '<span title="Recorrente mensal" class="text-xs text-blue-600 ml-1">↻</span>' : ''}</td>
+                                    <td class="p-3"><span class="text-xs bg-gray-100 px-2 py-1 rounded">${escapeHtml(item.categoria || 'Outros')}</span></td>
                                     <td class="p-3"><span class="text-xs bg-gray-100 px-2 py-1 rounded capitalize">${item.tipo}</span></td>
                                     <td class="p-3 text-red-600 font-bold">R$ ${fmt(parseFloat(item.valor))}</td>
                                     <td class="p-3 text-right whitespace-nowrap">
@@ -722,9 +893,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                         <div class="bg-white rounded-lg shadow p-3 border-l-4 border-red-500">
                             <div class="flex justify-between items-start gap-2">
                                 <div class="min-w-0 flex-1">
-                                    <p class="font-medium truncate">${item.descricao}</p>
+                                    <p class="font-medium truncate">${escapeHtml(item.descricao)} ${item.recorrente ? '<span title="Recorrente mensal" class="text-xs text-blue-600">↻</span>' : ''}</p>
                                     <div class="flex items-center gap-2 mt-1 flex-wrap">
                                         <span class="text-xs text-gray-500">${formatDateBR(item.data)}</span>
+                                        <span class="text-xs bg-gray-100 px-2 py-0.5 rounded">${escapeHtml(item.categoria || 'Outros')}</span>
                                         <span class="text-xs bg-gray-100 px-2 py-0.5 rounded capitalize">${item.tipo}</span>
                                         <button onclick="toggleStatus('saidas', ${item.id}, '${item.status}')" class="px-2 py-0.5 rounded text-xs font-bold ${item.status === 'pago' ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}">${item.status.toUpperCase()}</button>
                                     </div>
@@ -742,6 +914,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </div>
             `}
         `;
+        const searchEl = document.getElementById('saidas-search');
+        if (searchEl && filter.q) {
+            const len = searchEl.value.length;
+            searchEl.focus();
+            try { searchEl.setSelectionRange(len, len); } catch (_) {}
+        }
     }
 
     // --- Módulo 4: Dívidas ---
@@ -752,6 +930,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         let items = all;
         if (filter.status === 'ativas') items = all.filter(isAtiva);
         else if (filter.status === 'quitadas') items = all.filter(it => !isAtiva(it));
+        if (filter.q && filter.q.trim()) {
+            const q = normSearch(filter.q);
+            items = items.filter(i => normSearch(i.nome).includes(q));
+        }
         if (filter.sort === 'vencimento') items.sort((a, b) => (a.vencimento || '').localeCompare(b.vencimento || ''));
         else items.sort((a, b) => parseFloat(b.saldoDevedor || 0) - parseFloat(a.saldoDevedor || 0));
 
@@ -819,6 +1001,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </button>
             </div>
 
+            <div class="bg-white p-3 rounded-lg shadow mb-4">
+                <input type="search" id="dividas-search" value="${escapeHtml(filter.q)}" placeholder="Buscar por nome..." class="w-full p-2 border-2 border-gray-200 rounded-lg focus:border-orange-500 outline-none text-sm" oninput="onSearchInput('dividas', this.value)">
+            </div>
+
             ${items.length === 0 ? `
                 <div class="bg-white rounded-lg shadow p-10 text-center">
                     <div class="bg-orange-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -867,6 +1053,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </div>
             `}
         `;
+        const searchEl = document.getElementById('dividas-search');
+        if (searchEl && filter.q) {
+            const len = searchEl.value.length;
+            searchEl.focus();
+            try { searchEl.setSelectionRange(len, len); } catch (_) {}
+        }
     }
 
     // --- Módulo 5: Poupança ---
@@ -1004,6 +1196,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         let items = all;
         if (filter.status === 'ativas') items = all.filter(it => !isConcluida(it));
         else if (filter.status === 'concluidas') items = all.filter(isConcluida);
+        if (filter.q && filter.q.trim()) {
+            const q = normSearch(filter.q);
+            items = items.filter(i => normSearch(i.nome).includes(q));
+        }
 
         const fmt = (n) => n.toLocaleString('pt-BR', { minimumFractionDigits: 2 });
         const totalAlvo = all.reduce((a, b) => a + parseFloat(b.valorAlvo || 0), 0);
@@ -1065,6 +1261,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </button>
             </div>
 
+            <div class="bg-white p-3 rounded-lg shadow mb-4">
+                <input type="search" id="metas-search" value="${escapeHtml(filter.q)}" placeholder="Buscar por nome..." class="w-full p-2 border-2 border-gray-200 rounded-lg focus:border-purple-500 outline-none text-sm" oninput="onSearchInput('metas', this.value)">
+            </div>
+
             ${items.length === 0 ? `
                 <div class="bg-white rounded-lg shadow p-10 text-center">
                     <div class="bg-purple-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -1120,17 +1320,31 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </div>
             `}
         `;
+        const searchEl = document.getElementById('metas-search');
+        if (searchEl && filter.q) {
+            const len = searchEl.value.length;
+            searchEl.focus();
+            try { searchEl.setSelectionRange(len, len); } catch (_) {}
+        }
     }
 
     // --- Módulo 7: Configurações (Backup / Restauração) ---
-    const BACKUP_TABLES = ['entradas', 'saidas', 'dividas', 'poupanca', 'metas'];
+    const BACKUP_TABLES = ['entradas', 'saidas', 'dividas', 'poupanca', 'metas', 'categorias'];
 
     async function renderConfiguracoes(container) {
         const counts = {};
         for (const t of BACKUP_TABLES) counts[t] = await db[t].count();
-        const total = Object.values(counts).reduce((a, b) => a + b, 0);
+        const total = counts.entradas + counts.saidas + counts.dividas + counts.poupanca + counts.metas;
         const autoLockCfg = await db.config.get('autoLockMinutes');
         const autoLockMin = autoLockCfg ? parseFloat(autoLockCfg.value) : 5;
+        const cats = await getCategorias();
+        const catsEntrada = cats.filter(c => c.kind === 'entrada');
+        const catsSaida = cats.filter(c => c.kind === 'saida');
+        const catItem = (c) => `
+            <span class="inline-flex items-center gap-1 bg-gray-100 text-gray-700 text-xs px-2 py-1 rounded-full">
+                ${escapeHtml(c.nome)}
+                <button onclick="deleteCategoria(${c.id}, '${escapeHtml(c.nome).replace(/'/g, "\\'")}', '${c.kind}')" class="text-gray-400 hover:text-red-600 ml-1" title="Excluir">×</button>
+            </span>`;
 
         container.innerHTML = `
             <h2 class="text-xl font-bold mb-4">Configurações</h2>
@@ -1149,6 +1363,25 @@ document.addEventListener('DOMContentLoaded', async () => {
                     <button onclick="saveAutoLock()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">Salvar</button>
                 </div>
                 <p class="text-xs text-gray-500 mt-2">O app será bloqueado após o tempo escolhido sem interação. Definir como "Desativado" mantém o app aberto até você bloquear manualmente.</p>
+            </div>
+
+            <div class="bg-white rounded-lg shadow p-4 mb-4">
+                <h3 class="font-bold mb-3">Categorias</h3>
+                <div class="mb-3">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm font-medium text-gray-700">Entradas (${catsEntrada.length})</span>
+                        <button onclick="addCategoria('entrada')" class="text-xs text-blue-600 hover:underline">+ Nova</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1">${catsEntrada.map(catItem).join('') || '<span class="text-xs text-gray-400">Nenhuma categoria.</span>'}</div>
+                </div>
+                <div>
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm font-medium text-gray-700">Saídas (${catsSaida.length})</span>
+                        <button onclick="addCategoria('saida')" class="text-xs text-blue-600 hover:underline">+ Nova</button>
+                    </div>
+                    <div class="flex flex-wrap gap-1">${catsSaida.map(catItem).join('') || '<span class="text-xs text-gray-400">Nenhuma categoria.</span>'}</div>
+                </div>
+                <p class="text-xs text-gray-500 mt-3">Excluir uma categoria nao altera os lancamentos ja criados — eles continuam com o nome antigo gravado.</p>
             </div>
 
             <div class="bg-white rounded-lg shadow p-4 mb-4">
@@ -1188,6 +1421,37 @@ document.addEventListener('DOMContentLoaded', async () => {
         await db.config.put({ key: 'autoLockMinutes', value: isNaN(v) ? 0 : v });
         await resetInactivityTimer();
         toast('Configuração salva.', 'success');
+    };
+
+    window.addCategoria = async (kind) => {
+        const nome = await promptDialog({
+            title: 'Nova categoria',
+            message: `Nome da categoria (${kind === 'entrada' ? 'entrada' : 'saída'}):`,
+            okText: 'Criar'
+        });
+        if (!nome || !nome.trim()) return;
+        try {
+            await db.categorias.add({ nome: nome.trim(), kind });
+            refreshCategorias();
+            toast('Categoria criada.', 'success');
+            renderView('configuracoes');
+        } catch (err) {
+            toast('Categoria ja existe.', 'warning');
+        }
+    };
+
+    window.deleteCategoria = async (id, nome, kind) => {
+        const ok = await confirmDialog({
+            title: 'Excluir categoria',
+            message: `Excluir a categoria "${nome}"? Lancamentos ja salvos com esse nome NAO sao alterados.`,
+            okText: 'Excluir',
+            danger: true
+        });
+        if (!ok) return;
+        await db.categorias.delete(id);
+        refreshCategorias();
+        toast('Categoria removida.', 'success');
+        renderView('configuracoes');
     };
 
     window.exportData = async () => {
@@ -1300,7 +1564,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     // --- Funções de CRUD e Modais ---
-    window.showModal = (type, id = null) => {
+    const escapeHtml = (s) => (s || '').toString()
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+    window.showModal = async (type, id = null) => {
         const modal = document.getElementById('modal');
         const modalBody = document.getElementById('modal-body');
         modal.classList.remove('hidden');
@@ -1317,10 +1585,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         const inputCls = 'w-full p-2 border-2 border-gray-200 rounded-lg mb-3 focus:border-blue-500 outline-none';
         const labelCls = 'block text-xs font-medium text-gray-600 mb-1';
         const money = (id_, placeholder) => `<input type="text" id="${id_}" inputmode="decimal" placeholder="${placeholder}" class="${inputCls}">`;
+        const isEntrada = (type === 'entrada' || type === 'entradas');
+        const isSaida = (type === 'saida' || type === 'saidas');
+        const categoriaKind = isEntrada ? 'entrada' : (isSaida ? 'saida' : null);
+        const cats = categoriaKind ? await getCategorias(categoriaKind) : [];
+        const catOptions = cats.map(c => `<option value="${escapeHtml(c.nome)}">${escapeHtml(c.nome)}</option>`).join('')
+            + `<option value="__nova__">+ Nova categoria…</option>`;
+        const catBlock = categoriaKind ? `
+            <label class="${labelCls}">Categoria</label>
+            <select id="m-categoria" class="${inputCls}" onchange="onCategoriaSelectChange('${categoriaKind}', this)">${catOptions}</select>
+        ` : '';
+        const recorrenteBlock = categoriaKind ? `
+            <label class="inline-flex items-center gap-2 text-sm text-gray-700 mb-3 cursor-pointer">
+                <input type="checkbox" id="m-recorrente" class="w-4 h-4 rounded border-gray-300">
+                <span>Repetir mensalmente (recorrente)</span>
+            </label>
+        ` : '';
         let fields = '';
         let action = id ? `updateItem('${type}', ${id})` : `saveItem('${type}')`;
 
-        if (type === 'entrada' || type === 'entradas') {
+        if (isEntrada) {
             fields = `
                 <label class="${labelCls}">Descrição</label>
                 <input type="text" id="m-desc" placeholder="Ex.: Salário" class="${inputCls}">
@@ -1328,8 +1612,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ${money('m-valor', 'Ex.: 3500,00')}
                 <label class="${labelCls}">Data</label>
                 <input type="date" id="m-data" value="${today}" class="${inputCls}">
+                ${catBlock}
+                ${recorrenteBlock}
             `;
-        } else if (type === 'saida' || type === 'saidas') {
+        } else if (isSaida) {
             fields = `
                 <label class="${labelCls}">Descrição</label>
                 <input type="text" id="m-desc" placeholder="Ex.: Mercado" class="${inputCls}">
@@ -1347,6 +1633,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                     <option value="pendente">Pendente</option>
                     <option value="pago">Pago</option>
                 </select>
+                ${catBlock}
+                ${recorrenteBlock}
             `;
         } else if (type === 'divida' || type === 'dividas') {
             fields = `
@@ -1410,11 +1698,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         const item = await db[type].get(id);
         if (!item) return;
         const set = (sel, v) => { const el = document.getElementById(sel); if (el) el.value = v ?? ''; };
+        const check = (sel, v) => { const el = document.getElementById(sel); if (el) el.checked = !!v; };
         if (type === 'entradas') {
             set('m-desc', item.descricao); set('m-valor', moneyForInput(item.valor)); set('m-data', item.data);
+            set('m-categoria', item.categoria || 'Outros'); check('m-recorrente', item.recorrente);
         } else if (type === 'saidas') {
             set('m-desc', item.descricao); set('m-valor', moneyForInput(item.valor)); set('m-data', item.data);
             set('m-tipo', item.tipo); set('m-status', item.status);
+            set('m-categoria', item.categoria || 'Outros'); check('m-recorrente', item.recorrente);
         } else if (type === 'dividas') {
             set('m-nome', item.nome); set('m-valorOriginal', moneyForInput(item.valorOriginal));
             set('m-saldoDevedor', moneyForInput(item.saldoDevedor)); set('m-vencimento', item.vencimento);
@@ -1425,6 +1716,32 @@ document.addEventListener('DOMContentLoaded', async () => {
             set('m-valorGuardado', moneyForInput(item.valorGuardado)); set('m-dataLimite', item.dataLimite);
         }
     }
+
+    // Cria categoria inline a partir do select (opcao "+ Nova categoria...")
+    window.onCategoriaSelectChange = async (kind, selectEl) => {
+        if (selectEl.value !== '__nova__') return;
+        const nome = await promptDialog({
+            title: 'Nova categoria',
+            message: `Nome da nova categoria (${kind === 'entrada' ? 'entrada' : 'saída'}):`,
+            okText: 'Criar'
+        });
+        if (!nome || !nome.trim()) { selectEl.value = 'Outros'; return; }
+        const nomeOk = nome.trim();
+        try {
+            await db.categorias.add({ nome: nomeOk, kind });
+            refreshCategorias();
+            // Re-injeta a opcao na posicao correta (antes do "+ Nova")
+            const newOpt = document.createElement('option');
+            newOpt.value = nomeOk; newOpt.textContent = nomeOk;
+            const novaOpt = Array.from(selectEl.options).find(o => o.value === '__nova__');
+            selectEl.insertBefore(newOpt, novaOpt);
+            selectEl.value = nomeOk;
+            toast('Categoria criada.', 'success');
+        } catch (err) {
+            toast('Categoria ja existe ou nome invalido.', 'warning');
+            selectEl.value = 'Outros';
+        }
+    };
 
     // Constrói e valida o payload a partir do form do modal.
     // Retorna { data, error } — se error não é null, exibe toast e cancela.
@@ -1447,14 +1764,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         const table = norm(type);
         let data = {}, error = null;
 
+        const checked = (sel) => { const el = document.getElementById(sel); return el ? (el.checked ? 1 : 0) : 0; };
+        const catOrDefault = (sel) => {
+            const v = val(sel);
+            return (!v || v === '__nova__') ? 'Outros' : v;
+        };
         if (table === 'entradas') {
             const desc = val('m-desc'), valor = val('m-valor'), dataI = val('m-data');
             error = reqText(desc, 'Descrição') || reqMoney(valor, 'Valor') || reqDate(dataI, 'Data');
-            data = { descricao: desc, valor: parseValor(valor), data: dataI };
+            data = { descricao: desc, valor: parseValor(valor), data: dataI,
+                categoria: catOrDefault('m-categoria'), recorrente: checked('m-recorrente') };
         } else if (table === 'saidas') {
             const desc = val('m-desc'), valor = val('m-valor'), dataI = val('m-data');
             error = reqText(desc, 'Descrição') || reqMoney(valor, 'Valor') || reqDate(dataI, 'Data');
-            data = { descricao: desc, valor: parseValor(valor), data: dataI, tipo: val('m-tipo'), status: val('m-status') };
+            data = { descricao: desc, valor: parseValor(valor), data: dataI, tipo: val('m-tipo'), status: val('m-status'),
+                categoria: catOrDefault('m-categoria'), recorrente: checked('m-recorrente') };
         } else if (table === 'dividas') {
             const nome = val('m-nome'), vo = val('m-valorOriginal'), sd = val('m-saldoDevedor'), venc = val('m-vencimento');
             error = reqText(nome, 'Credor') || reqMoney(vo, 'Valor original') || reqMoney(sd, 'Saldo atual', { allowZero: true }) || reqDate(venc, 'Vencimento');
@@ -1529,6 +1853,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         state.entradasFilter.mode = state.entradasFilter.mode === 'month' ? 'all' : 'month';
         renderView('entradas');
     };
+    window.setEntradasCategoria = (v) => { state.entradasFilter.categoria = v; renderView('entradas'); };
 
     // --- Filtros: Saídas ---
     window.changeSaidasMonth = (delta) => {
@@ -1539,6 +1864,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.toggleSaidasMode = () => { state.saidasFilter.mode = state.saidasFilter.mode === 'month' ? 'all' : 'month'; renderView('saidas'); };
     window.setSaidasStatus = (s) => { state.saidasFilter.status = s; renderView('saidas'); };
     window.setSaidasTipo = (t) => { state.saidasFilter.tipo = t; renderView('saidas'); };
+    window.setSaidasCategoria = (v) => { state.saidasFilter.categoria = v; renderView('saidas'); };
 
     // --- Filtros: Dívidas ---
     window.setDividasStatus = (s) => { state.dividasFilter.status = s; renderView('dividas'); };
@@ -1555,6 +1881,19 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // --- Filtros: Metas ---
     window.setMetasStatus = (s) => { state.metasFilter.status = s; renderView('metas'); };
+
+    // --- Busca textual debounced ---
+    const _searchTimers = {};
+    const _searchTargets = { entradas: 'entradasFilter', saidas: 'saidasFilter', dividas: 'dividasFilter', poupanca: 'poupancaFilter', metas: 'metasFilter' };
+    window.onSearchInput = (view, value) => {
+        const key = _searchTargets[view];
+        if (!key) return;
+        clearTimeout(_searchTimers[view]);
+        _searchTimers[view] = setTimeout(() => {
+            state[key].q = value;
+            renderView(view);
+        }, 250);
+    };
 
     // --- Dashboard ---
     window.setReservaMeta = async () => {
