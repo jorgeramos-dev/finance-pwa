@@ -15,6 +15,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Garante categorias padrao (idempotente)
     try { await ensureCategoriasSeed(); } catch (err) { console.warn('Seed categorias falhou:', err); }
 
+    // Tema (light | dark | auto). Aplicado o quanto antes para evitar flash.
+    const applyTheme = (theme) => {
+        const root = document.documentElement;
+        let dark;
+        if (theme === 'dark') dark = true;
+        else if (theme === 'auto') dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        else dark = false;
+        root.classList.toggle('dark', dark);
+    };
+    window.applyTheme = applyTheme;
+    try {
+        const themeCfg = await db.config.get('theme');
+        applyTheme((themeCfg && themeCfg.value) || 'light');
+    } catch (_) {}
+    if (window.matchMedia) {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', async () => {
+            const cfg = await db.config.get('theme');
+            if (cfg && cfg.value === 'auto') applyTheme('auto');
+        });
+    }
+
     // Estado da Aplicação
     const state = {
         isLocked: true,
@@ -36,26 +57,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
     const refreshCategorias = () => { _categoriasCache = null; };
 
-    // Normaliza texto para busca (case/acento-insensivel)
-    const normSearch = (s) => (s || '').toString().toLowerCase()
-        .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-
-    // Helpers de mês (YYYY-MM)
-    const getPrevMonth = (yyyymm) => {
-        const [y, m] = yyyymm.split('-').map(Number);
-        const d = new Date(y, m - 2, 1);
-        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    };
-    const getNextMonth = (yyyymm) => {
-        const [y, m] = yyyymm.split('-').map(Number);
-        const d = new Date(y, m, 1);
-        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    };
-    const formatMonthLabel = (yyyymm) => {
-        const [y, m] = yyyymm.split('-').map(Number);
-        const meses = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
-        return `${meses[m - 1]}/${y}`;
-    };
+    // Helpers puros (parseValor, normSearch, formatDateBR, formatMonthLabel,
+    // getPrevMonth, getNextMonth, escapeHtml, fmtBR) vivem em src/utils.js
+    // e sao acessiveis como globais. Mantemos aliases locais para legibilidade.
+    const { normSearch, formatMonthLabel, getPrevMonth, getNextMonth,
+        parseValor, escapeHtml, formatDateBR, fmtBR } = window.AppUtils;
 
     // Gera lancamentos recorrentes do mes corrente a partir do template (ultimo registro recorrente
     // com o mesmo descricao+categoria). Idempotente: usa db.config['recurringLastRun'] para nao
@@ -109,16 +115,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (created > 0) setTimeout(() => toast(`${created} lancamento(s) recorrente(s) gerado(s) para ${formatMonthLabel(nowMonth)}.`, 'info', 4000), 400);
     }
 
-    // Parser de valor monetário BR (aceita "1.234,56", "1234.56", " R$ 12,30 ")
-    const parseValor = (input) => {
-        if (input === null || input === undefined) return NaN;
-        let s = String(input).trim().replace(/[R$\s]/g, '');
-        if (!s) return NaN;
-        if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
-        const n = parseFloat(s);
-        return isNaN(n) ? NaN : n;
-    };
-    const fmtBR = (n) => Number(n || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    // parseValor e fmtBR vivem em src/utils.js (alias acima)
 
     // --- UI Helpers: toast / confirm / prompt ---
     const toast = (msg, type = 'info', ms = 2800) => {
@@ -205,24 +202,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const forgotPinBtn = document.getElementById('forgot-pin-btn');
 
     // Inicialização de Segurança
-    // Hashing de PIN (PBKDF2 + salt) usando SubtleCrypto
-    const toHex = (buf) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-    const fromHex = (hex) => { const a = new Uint8Array(hex.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(hex.substr(i * 2, 2), 16); return a; };
-    const hashPin = async (pin, saltHex) => {
-        const enc = new TextEncoder();
-        const salt = saltHex ? fromHex(saltHex) : crypto.getRandomValues(new Uint8Array(16));
-        const key = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveBits']);
-        const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256);
-        return { salt: toHex(salt), hash: toHex(bits) };
-    };
-    const verifyPin = async (pin, stored) => {
-        if (!stored) return false;
-        if (typeof stored.value === 'string') return stored.value === pin; // legado: PIN em claro
-        const { salt, hash } = stored.value || {};
-        if (!salt || !hash) return false;
-        const r = await hashPin(pin, salt);
-        return r.hash === hash;
-    };
+    // hashPin/verifyPin vivem em src/security.js (carregado antes de app.js)
+    const { hashPin, verifyPin } = window.AppSecurity;
 
     const checkSecurity = async () => {
         const config = await db.config.get('pin');
@@ -1337,6 +1318,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const total = counts.entradas + counts.saidas + counts.dividas + counts.poupanca + counts.metas;
         const autoLockCfg = await db.config.get('autoLockMinutes');
         const autoLockMin = autoLockCfg ? parseFloat(autoLockCfg.value) : 5;
+        const themeCfg = await db.config.get('theme');
+        const theme = (themeCfg && themeCfg.value) || 'light';
         const cats = await getCategorias();
         const catsEntrada = cats.filter(c => c.kind === 'entrada');
         const catsSaida = cats.filter(c => c.kind === 'saida');
@@ -1348,6 +1331,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         container.innerHTML = `
             <h2 class="text-xl font-bold mb-4">Configurações</h2>
+
+            <div class="bg-white rounded-lg shadow p-4 mb-4">
+                <h3 class="font-bold mb-2">Aparência</h3>
+                <label class="block text-sm text-gray-600 mb-1">Tema</label>
+                <div class="flex items-center gap-2">
+                    <select id="cfg-theme" class="flex-1 p-2 border-2 border-gray-200 rounded-lg focus:border-blue-500 outline-none">
+                        <option value="light" ${theme === 'light' ? 'selected' : ''}>Claro</option>
+                        <option value="dark" ${theme === 'dark' ? 'selected' : ''}>Escuro</option>
+                        <option value="auto" ${theme === 'auto' ? 'selected' : ''}>Seguir sistema</option>
+                    </select>
+                    <button onclick="saveTheme()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">Salvar</button>
+                </div>
+                <p class="text-xs text-gray-500 mt-2">"Seguir sistema" usa a preferência do seu dispositivo (claro ou escuro).</p>
+            </div>
 
             <div class="bg-white rounded-lg shadow p-4 mb-4">
                 <h3 class="font-bold mb-2">Segurança</h3>
@@ -1421,6 +1418,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         await db.config.put({ key: 'autoLockMinutes', value: isNaN(v) ? 0 : v });
         await resetInactivityTimer();
         toast('Configuração salva.', 'success');
+    };
+
+    window.saveTheme = async () => {
+        const v = document.getElementById('cfg-theme').value;
+        await db.config.put({ key: 'theme', value: v });
+        applyTheme(v);
+        toast('Tema atualizado.', 'success');
     };
 
     window.addCategoria = async (kind) => {
@@ -1564,9 +1568,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     // --- Funções de CRUD e Modais ---
-    const escapeHtml = (s) => (s || '').toString()
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    // escapeHtml ja foi importado de window.AppUtils no topo do arquivo.
 
     window.showModal = async (type, id = null) => {
         const modal = document.getElementById('modal');

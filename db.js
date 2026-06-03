@@ -51,18 +51,7 @@ db.version(2).stores({
   }
 });
 
-// Funções auxiliares de formatação de data para o padrão brasileiro
-const formatDateBR = (dateStr) => {
-  if (!dateStr) return "";
-  const [year, month, day] = dateStr.split("-");
-  return `${day}/${month}/${year}`;
-};
-
-const parseDateBR = (dateBR) => {
-  if (!dateBR) return "";
-  const [day, month, year] = dateBR.split("/");
-  return `${year}-${month}-${day}`;
-};
+// formatDateBR/parseDateBR foram movidos para src/utils.js (carregado antes deste arquivo)
 
 // Garante que a tabela de categorias tenha as opcoes padrao (idempotente,
 // funciona tanto em DB novo quanto em upgrade da v1)
@@ -90,6 +79,4 @@ async function ensureCategoriasSeed() {
 
 // Exportar db para uso no app.js
 window.db = db;
-window.formatDateBR = formatDateBR;
-window.parseDateBR = parseDateBR;
 window.ensureCategoriasSeed = ensureCategoriasSeed;

@@ -8,7 +8,9 @@
     "watch:css": "tailwindcss -i ./tailwind.input.css -o ./tailwind.css --watch",
     "gen:icons": "node scripts/gen-icons.js",
     "build": "npm run gen:icons && npm run build:css",
-    "start": "npx serve ."
+    "start": "npx serve .",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "repository": {
     "type": "git",
@@ -23,7 +25,9 @@
   },
   "homepage": "https://github.com/jorgeramos-dev/finance-pwa#readme",
   "devDependencies": {
+    "jsdom": "^24.0.0",
     "sharp": "^0.34.5",
-    "tailwindcss": "^3.4.1"
+    "tailwindcss": "^3.4.1",
+    "vitest": "^1.6.0"
   }
 }

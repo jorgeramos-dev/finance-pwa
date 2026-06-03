@@ -1,9 +1,11 @@
-const CACHE_NAME = 'finance-pwa-v6';
+const CACHE_NAME = 'finance-pwa-v7';
 const ASSETS = [
   './',
   './index.html',
   './app.js',
   './db.js',
+  './src/utils.js',
+  './src/security.js',
   './tailwind.css',
   './manifest.json',
   './icons/icon-192x192.png',
